@@ -1,0 +1,174 @@
+# Qwen3-ASR SFT 配方（语音编码器 + Qwen3 文本解码器）。
+#
+# 数据契约与官方 QwenLM/Qwen3-ASR 的 finetuning/ 目录保持一致：JSONL 每行一条
+# 语音-文本对，字段为 audio（wav 路径）与 text（转写文本，可带语言前缀）：
+#   {"audio": "/data/wavs/utt0001.wav", "text": "language English<asr_text>Hello."}
+# 语言未知时官方建议写成 "language None<asr_text>..."。
+#
+# 演示数据由同目录脚本生成（默认 8 条合成语音，仅用于打通链路）：
+#   python hyper_parallel/models/qwen3_asr/recipes/prepare_asr_data.py \
+#     --output-dir ./qwen3_asr_demo_data --num-samples 8
+#
+# 模型与 processor 是同一个本地目录（Qwen3-ASR-1.7B 的 HF 格式权重）。
+# 该目录必须离线可用：缺资源时显式报错，不做隐式下载。
+
+model:
+  _target_: hyper_parallel.models.HyperAutoModelForImageTextToText.from_pretrained
+  pretrained_model_name_or_path: /path/to/Qwen3-ASR-1.7B-hf
+  torch_dtype: bfloat16
+  attn_implementation: eager
+  local_files_only: true
+
+training:
+  train_iters: 20
+  global_batch_size: 8
+  micro_batch_size: 1
+  backend: hccl
+  init_device: meta
+  loss_aggregation: token_weighted
+  max_grad_norm: 1.0
+  seed: 42
+
+accelerator:
+  tp_size: 1
+  cp_size: 1
+  ep_size: 1
+  pp_size: 1
+  sequence_parallel: false
+  loss_parallel: false
+
+plan_overrides:
+  # 语音编码器与音频投影器不匹配任何内置边界模板（层容器末段是数字，被
+  # numeric-segment guard 判为 unknown），因此其“整棵子树复制”的布局必须在
+  # 配方里显式声明：编码器注意力在完整 hidden 维上 reshape heads，卷积栈也
+  # 无法按 head 切分；投影器是两个塔之间的 pointwise MLP。只有文本塔走通用
+  # colwise/rowwise 规则。
+  #
+  # 逐叶点名的原因：sharding 动作的 match 只接受单个字符串（列表仅用于
+  # replace.kind='module'），而 glob 的 `*` 跨点号，`model.audio_tower.*`
+  # 会命中 positional_embedding 这类无 weight 的模块，声明出的 params 找不到
+  # 对应参数。
+  - match: "model.audio_tower.conv2d[123]"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  # conv_out 无 bias。
+  - match: "model.audio_tower.conv_out"
+    params:
+      weight: {tp: replicate}
+  - match: "model.audio_tower.ln_post"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.self_attn.q_proj"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.self_attn.k_proj"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.self_attn.v_proj"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.self_attn.out_proj"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.self_attn_layer_norm"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.fc1"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.fc2"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.audio_tower.layers.*.final_layer_norm"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.multi_modal_projector.linear_1"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+  - match: "model.multi_modal_projector.linear_2"
+    params:
+      weight: {tp: replicate}
+      bias: {tp: replicate}
+
+fsdp_config:
+  dp_shard_size: 8
+  reshard_after_forward: true
+  requires_grad_sync: true
+
+mixed_precision:
+  enabled: false
+
+activation_checkpoint:
+  mode: "off"
+
+dataset:
+  training_mode: sft
+  model_assets:
+    # 与 model 指向同一目录：Qwen3ASRProcessor 需要 tokenizer + 特征提取器。
+    _target_: hyper_parallel.data.omni.build_auto_processor
+    pretrained_model_name_or_path: /path/to/Qwen3-ASR-1.7B-hf
+    local_files_only: true
+  data_transform:
+    _target_: hyper_parallel.models.qwen3_asr.adapter.data.transform_fn.build_qwen3_asr_transform
+    max_seq_len: 2048
+    # 单样本批次可不设；micro_batch_size > 1 时两者都必须给固定值：语谱图按
+    # audio_pad_frames 对齐，token 序列按 pad_to_length 补齐，否则不同长度
+    # 的样本无法堆叠成同一个张量。
+    audio_pad_frames: null
+    pad_to_length: null
+  _target_: hyper_parallel.data.omni.build_online_omni_mapping_dataset
+  data_path: /path/to/qwen3_asr_demo_data/train.jsonl
+  data_config: {}
+
+dataloader:
+  _target_: hyper_parallel.data.batching.FixedBatchDataLoader
+  collate_fn:
+    _target_: hyper_parallel.data.batching.build_omni_collate_fn
+  get_batch:
+    _target_: hyper_parallel.data.batching.OmniParallelBatch
+  sampler_type: single
+  data_rearrange_map: null
+  data_sharding: false
+  drop_last: true
+  use_background_prefetcher: true
+  # 音频解码 + fbank 是每步最重的 CPU 开销，交给 worker 进程与上一个
+  # forward/backward 重叠。
+  num_workers: 4
+  pin_memory: false
+  prefetch_factor: null
+
+optimizer:
+  _target_: hyper_parallel.components.optim.builders.AdamW
+  no_decay_params: [bias, norm, ln_]
+  adamw_config:
+    adamw_lr: 2.0e-5
+    adamw_weight_decay: 0.0
+    adamw_betas: [0.9, 0.999]
+    adamw_eps: 1.0e-8
+
+lr_scheduler:
+  _target_: hyper_parallel.components.optim.lr_scheduler.MultiLRScheduler
+  lr_decay_style: cosine
+  lr_config:
+    lr_warmup_steps: 1
+    min_lr: 0.0
+
+checkpoint:
+  save_ckpt: false
+  restore_from: null
+  checkpoint_dir: ./outputs/training_demo/qwen3_asr/checkpoints
+
+debug:
+  check_nan_inf: true
+  check_dataset: null

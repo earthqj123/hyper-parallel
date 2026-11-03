@@ -365,6 +365,23 @@ def _module_replacements_covered_by_generated(
     return meta is not None and bool((meta.covered or {}).get("module_overrides"))
 
 
+def _restore_tied_parameters(model: nn.Module) -> None:
+    """Re-bind declared tied parameters after materialization.
+
+    ``Module.to_empty()`` rebuilds every parameter on the target device via
+    ``_apply``, which drops the storage an earlier ``tie_weights()`` shared.
+    A checkpoint stores a tied pair once, so the second name would otherwise
+    stay uninitialized and the loader's storage check fails. Re-running the
+    model's own tying contract restores the invariant it declares in
+    ``all_tied_weights_keys``.
+    """
+    tied_keys = getattr(model, "all_tied_weights_keys", None)
+    tie_weights = getattr(model, "tie_weights", None)
+    if not tied_keys or not callable(tie_weights):
+        return
+    tie_weights(recompute_mapping=False)
+
+
 def _move_model_to_device(
     model: nn.Module,
     is_meta_device: bool,
@@ -379,6 +396,7 @@ def _move_model_to_device(
         return model
 
     model.to_empty(device=device)
+    _restore_tied_parameters(model)
     return model
 
 

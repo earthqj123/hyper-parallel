@@ -349,12 +349,44 @@ def rebuild_materialized_state(
         _validate_protected_model_state(model, protected)
 
 
+def build_rope_buffer_factory(rotary: nn.Module) -> Callable[["MaterializationContext"], torch.Tensor]:
+    """Return a rebuild recipe for one module's RoPE cosine/sine frequencies.
+
+    RoPE frequencies are non-persistent buffers: absent from every checkpoint and
+    left uninitialized by ``to_empty()``. They are deterministic from the effective
+    model config, so adapters declare them rebuildable instead of promoting them to
+    checkpoint state.
+    """
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS  # pylint: disable=C0415
+
+    rope_function = (rotary.compute_default_rope_parameters if rotary.rope_type == "default"
+                     else ROPE_INIT_FUNCTIONS[rotary.rope_type])
+
+    def rebuild(context: "MaterializationContext") -> torch.Tensor:
+        # Computed on CPU: NPU pow differs by FP32 ULPs that can flip BF16 cos/sin
+        # at later positions.
+        value, _ = rope_function(rotary.config, device=torch.device("cpu"))
+        return value.to(device=context.device)
+
+    return rebuild
+
+
+def register_rope_buffers(rotary: nn.Module) -> None:
+    """Declare one module's RoPE frequency buffers as rebuildable."""
+    factory = build_rope_buffer_factory(rotary)
+    for name in ("inv_freq", "original_inv_freq"):
+        if name in rotary._buffers:  # pylint: disable=protected-access
+            register_rebuildable_buffer(rotary, name, factory=factory)
+
+
 __all__ = [
     "MaterializationContext",
     "MaterializationReason",
     "MaterializedStateHook",
     "RebuildableBufferSpec",
+    "build_rope_buffer_factory",
     "rebuild_materialized_state",
     "register_materialized_state_hook",
     "register_rebuildable_buffer",
+    "register_rope_buffers",
 ]
